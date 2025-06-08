@@ -21,15 +21,10 @@ In this project, a subset of classes was used:
 
 **Libraries and Tools Used**
 1. PyTorch & PyTorch Geometric – for CNN and GNN implementation
-
 2. timm – to load pretrained EfficientNet
-
 3. Albumentations – for advanced data augmentation
-
 4. sklearn – for train-test split, evaluation metrics
-
 5. matplotlib, seaborn – for visualization
-
 6. PIL, numpy, shutil, os – for image and filesystem handling
 
 
@@ -40,11 +35,7 @@ The model achieved high performance on the test set, showing strong generalizati
 
 **Future Improvements**
 1. Expand to use the full PlantDoc dataset with all 27+ classes
-
 2. Integrate Vision Transformers (ViTs) or Graph Attention Networks (GAT) for enhanced accuracy
-
 3. Build a web interface using Streamlit or Flask for user-friendly disease diagnosis
-
 4. Incorporate self-supervised learning to reduce reliance on labeled data
-
 5. Deploy the model to mobile or edge devices for offline use in agriculture
