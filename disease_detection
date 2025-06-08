@@ -1,0 +1,592 @@
+!pip install torch-geometric -q
+import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from torch_geometric.nn import GCNConv, global_mean_pool, BatchNorm
+from torch_geometric.data import Data, DataLoader, Batch
+from torchvision.datasets import ImageFolder
+from PIL import Image
+import numpy as np
+import timm
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+from torch.utils.data import Subset, DataLoader as TorchDataLoader
+from shutil import copytree
+from collections import Counter
+from sklearn.model_selection import train_test_split
+import matplotlib.pyplot as plt
+import random
+import seaborn as sns
+from sklearn.metrics import classification_report, confusion_matrix
+
+
+# Set device and enable mixed precision
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+
+# Enable mixed precision training for better efficiency
+from torch.cuda.amp import autocast, GradScaler
+scaler = GradScaler() if device.type == 'cuda' else None
+
+
+# 1. Enhanced CNN Feature Extractor using EfficientNet-B3
+class CNNModel(nn.Module):
+    def __init__(self, dropout_rate=0.3):
+        super(CNNModel, self).__init__()
+        # Use EfficientNet-B3 for better feature extraction
+        self.backbone = timm.create_model('efficientnet_b3', pretrained=True, num_classes=0)
+        self.feature_dim = self.backbone.num_features
+        self.dropout = nn.Dropout(dropout_rate)
+        self.bn = nn.BatchNorm1d(self.feature_dim)
+
+
+    def forward(self, x):
+        features = self.backbone(x)
+        features = self.bn(features)
+        features = self.dropout(features)
+        return features
+
+
+# 2. Enhanced GNN Model with Skip Connections and Attention
+class GNNModel(nn.Module):
+    def __init__(self, input_size, hidden_channels, num_classes, dropout_rate=0.3):
+        super(GNNModel, self).__init__()
+        self.conv1 = GCNConv(input_size, hidden_channels)
+        self.conv2 = GCNConv(hidden_channels, hidden_channels)
+        self.conv3 = GCNConv(hidden_channels, hidden_channels)
+
+
+        # Batch normalization layers
+        self.bn1 = BatchNorm(hidden_channels)
+        self.bn2 = BatchNorm(hidden_channels)
+        self.bn3 = BatchNorm(hidden_channels)
+
+
+        # Dropout layers
+        self.dropout = nn.Dropout(dropout_rate)
+
+
+        # Multi-layer classifier with skip connection
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_channels + input_size, hidden_channels // 2),  # Skip connection
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_channels // 2, num_classes)
+        )
+
+
+    def forward(self, data):
+        x, edge_index, batch = data.x, data.edge_index, data.batch
+        x_orig = x  # Store original features for skip connection
+
+
+        # First GCN layer
+        x = F.relu(self.bn1(self.conv1(x, edge_index)))
+        x = self.dropout(x)
+
+
+        # Second GCN layer
+        x = F.relu(self.bn2(self.conv2(x, edge_index)))
+        x = self.dropout(x)
+
+
+        # Third GCN layer
+        x = self.bn3(self.conv3(x, edge_index))
+
+
+        # Global pooling
+        x_pooled = global_mean_pool(x, batch)
+        x_orig_pooled = global_mean_pool(x_orig, batch)
+
+
+        # Skip connection: concatenate original and processed features
+        x_combined = torch.cat([x_pooled, x_orig_pooled], dim=1)
+
+
+        return self.classifier(x_combined)
+
+
+# 3. Enhanced Combined CNN-GNN Model
+class CNN_GNN_Model(nn.Module):
+    def __init__(self, num_classes, dropout_rate=0.3):
+        super(CNN_GNN_Model, self).__init__()
+        self.cnn = CNNModel(dropout_rate)
+        self.feature_dim = self.cnn.feature_dim
+        self.gnn = GNNModel(input_size=self.feature_dim, hidden_channels=256,
+                           num_classes=num_classes, dropout_rate=dropout_rate)
+
+
+    def construct_adaptive_knn_graph(self, features, k=7):
+        """Enhanced k-NN graph construction with adaptive k"""
+        batch_size = features.size(0)
+
+
+        if batch_size == 1:
+            return torch.tensor([[0], [0]], device=features.device)
+
+
+        # Adaptive k based on batch size
+        adaptive_k = min(max(3, k), batch_size - 1)
+
+
+        # Compute pairwise distances
+        dist = torch.cdist(features, features)
+
+
+        # Add small noise to break ties
+        noise = torch.randn_like(dist) * 1e-6
+        dist = dist + noise
+
+
+        # Find k nearest neighbors (excluding self)
+        knn_idx = dist.topk(k=adaptive_k + 1, largest=False).indices[:, 1:]
+
+
+        # Create bidirectional edges
+        edge_list = []
+        for i in range(batch_size):
+            for j in knn_idx[i]:
+                if i != j.item():  # Avoid self-loops
+                    edge_list.append([i, j.item()])
+
+
+        if not edge_list:  # Fallback: create a simple chain
+            edge_list = [[i, (i + 1) % batch_size] for i in range(batch_size)]
+
+
+        edge_index = torch.tensor(edge_list).t().to(features.device)
+        return edge_index
+
+
+    def forward(self, images, labels=None):
+        # Extract CNN features
+        features = self.cnn(images)
+
+
+        # Construct k-NN graph
+        edge_index = self.construct_adaptive_knn_graph(features)
+
+
+        # Create batch tensor
+        batch = torch.arange(images.size(0), dtype=torch.long, device=images.device)
+
+
+        # Create graph data
+        data = Data(x=features, edge_index=edge_index, batch=batch)
+
+
+        return self.gnn(data)
+
+
+# Enhanced Dataset classes
+class ImageFolderWithPaths(ImageFolder):
+    def __getitem__(self, index):
+        original_tuple = super().__getitem__(index)
+        path = self.imgs[index][0]
+        return original_tuple + (path,)
+
+
+class AlbumentationsDataset(torch.utils.data.Dataset):
+    def __init__(self, dataset, transform):
+        self.dataset = dataset
+        self.transform = transform
+
+
+    def __getitem__(self, idx):
+        image, label, path = self.dataset[idx]
+        image = image.convert("RGB")
+        image_np = np.array(image)
+        image = self.transform(image=image_np)['image']
+        return image, label, path
+
+
+    def __len__(self):
+        return len(self.dataset)
+
+
+# Clone Dataset
+print("📥 Downloading dataset...")
+os.system("git clone https://github.com/pratikkayal/PlantDoc-Dataset.git")
+
+
+source_path = "PlantDoc-Dataset/train"
+target_path = "PlantDoc_Filtered"
+os.makedirs(target_path, exist_ok=True)
+
+
+classes = ['Apple Scab Leaf', 'Apple rust leaf', 'Blueberry leaf', 'Peach leaf', 'Tomato leaf']
+
+
+for cls in classes:
+    src = os.path.join(source_path, cls)
+    dst = os.path.join(target_path, cls)
+    if os.path.exists(src):
+        copytree(src, dst, dirs_exist_ok=True)
+
+
+# Enhanced Albumentations Transforms
+train_transform = A.Compose([
+    A.RandomResizedCrop(size=(300, 300), scale=(0.8, 1.0)),  # Larger input size
+    A.HorizontalFlip(p=0.5),
+    A.VerticalFlip(p=0.2),
+    A.Rotate(limit=30),
+    A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.1, rotate_limit=15, p=0.5),
+    A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+    A.OneOf([
+        A.MotionBlur(blur_limit=3),
+        A.GaussianBlur(blur_limit=3),
+    ], p=0.3),
+    A.CoarseDropout(max_holes=8, max_height=20, max_width=20, p=0.3),
+    A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ToTensorV2()
+])
+
+
+val_transform = A.Compose([
+    A.LongestMaxSize(max_size=320),
+    A.PadIfNeeded(min_height=300, min_width=300, border_mode=0),
+    A.CenterCrop(300, 300),
+    A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ToTensorV2()
+])
+
+
+# Load and Split Dataset
+print("📊 Loading and splitting dataset...")
+full_dataset = ImageFolderWithPaths(target_path)
+class_names = full_dataset.classes
+num_classes = len(class_names)
+
+
+# Print class distribution
+class_counts = Counter([full_dataset[i][1] for i in range(len(full_dataset))])
+print("\nClass distribution:")
+for i, class_name in enumerate(class_names):
+    print(f"{class_name}: {class_counts[i]} images")
+
+
+indices = list(range(len(full_dataset)))
+train_idx, temp_idx = train_test_split(indices, train_size=0.7,
+                                      stratify=[full_dataset[i][1] for i in indices],
+                                      random_state=42)
+val_idx, test_idx = train_test_split(temp_idx, train_size=0.5,
+                                    stratify=[full_dataset[i][1] for i in temp_idx],
+                                    random_state=42)
+
+
+train_ds = AlbumentationsDataset(Subset(full_dataset, train_idx), train_transform)
+val_ds = AlbumentationsDataset(Subset(full_dataset, val_idx), val_transform)
+test_ds = AlbumentationsDataset(Subset(full_dataset, test_idx), val_transform)
+
+
+# Enhanced DataLoaders with optimized settings
+train_loader = TorchDataLoader(train_ds, batch_size=16, shuffle=True,
+                              num_workers=2, pin_memory=True)
+val_loader = TorchDataLoader(val_ds, batch_size=16, shuffle=False,
+                            num_workers=2, pin_memory=True)
+test_loader = TorchDataLoader(test_ds, batch_size=16, shuffle=False,
+                             num_workers=2, pin_memory=True)
+
+
+print(f"Dataset splits - Train: {len(train_ds)}, Val: {len(val_ds)}, Test: {len(test_ds)}")
+
+
+# Enhanced Training Setup
+model = CNN_GNN_Model(num_classes, dropout_rate=0.2).to(device)
+
+
+# Enhanced loss function with class weights
+class_weights = torch.tensor([1.0 / class_counts[i] for i in range(num_classes)]).to(device)
+class_weights = class_weights / class_weights.sum() * num_classes  # Normalize
+criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
+
+
+# Enhanced optimizer with weight decay
+optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=15, T_mult=2)
+
+
+# Enhanced Training Functions
+def train_epoch(model, loader):
+    model.train()
+    total, correct, loss_sum = 0, 0, 0
+
+
+    for batch_idx, (x, y, _) in enumerate(loader):
+        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+
+
+        optimizer.zero_grad()
+
+
+        if scaler:  # Mixed precision training
+            with autocast():
+                out = model(x)
+                loss = criterion(out, y)
+
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            out = model(x)
+            loss = criterion(out, y)
+            loss.backward()
+            optimizer.step()
+
+
+        total += y.size(0)
+        correct += (out.argmax(1) == y).sum().item()
+        loss_sum += loss.item() * y.size(0)
+
+
+        if batch_idx % 10 == 0:
+            print(f"Batch {batch_idx}/{len(loader)}, Loss: {loss.item():.4f}")
+
+
+    return loss_sum / total, 100 * correct / total
+
+
+def evaluate(model, loader):
+    model.eval()
+    total, correct, loss_sum = 0, 0, 0
+    all_preds, all_labels = [], []
+
+
+    with torch.no_grad():
+        for x, y, _ in loader:
+            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+
+
+            if scaler:
+                with autocast():
+                    out = model(x)
+                    loss = criterion(out, y)
+            else:
+                out = model(x)
+                loss = criterion(out, y)
+
+
+            total += y.size(0)
+            preds = out.argmax(1)
+            correct += (preds == y).sum().item()
+            loss_sum += loss.item() * y.size(0)
+
+
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(y.cpu().numpy())
+
+
+    return loss_sum / total, 100 * correct / total, all_preds, all_labels
+
+
+# Enhanced Training Loop
+print("\n🚀 Starting enhanced training...")
+patience = 10
+best_val_acc = 0
+patience_counter = 0
+train_losses, val_losses = [], []
+train_accs, val_accs = [], []
+
+
+for epoch in range(50):
+    print(f"\n📊 Epoch {epoch+1}/50")
+
+
+    train_loss, train_acc = train_epoch(model, train_loader)
+    val_loss, val_acc, _, _ = evaluate(model, val_loader)
+
+
+    scheduler.step()
+    current_lr = optimizer.param_groups[0]['lr']
+
+
+    train_losses.append(train_loss)
+    val_losses.append(val_loss)
+    train_accs.append(train_acc)
+    val_accs.append(val_acc)
+
+
+    print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
+    print(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%")
+    print(f"Learning Rate: {current_lr:.6f}")
+
+
+    if val_acc > best_val_acc:
+        best_val_acc = val_acc
+        patience_counter = 0
+        torch.save({
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'val_acc': val_acc,
+            'epoch': epoch,
+            'class_names': class_names
+        }, "best_model.pth")
+        print(f"✅ New best model saved! Val Acc: {val_acc:.2f}%")
+    else:
+        patience_counter += 1
+        if patience_counter >= patience:
+            print("⏹️ Early stopping triggered.")
+            break
+
+
+# Load best model for evaluation
+print(f"\n📈 Loading best model (Val Acc: {best_val_acc:.2f}%)")
+checkpoint = torch.load("best_model.pth")
+model.load_state_dict(checkpoint['model_state_dict'])
+
+
+# Final evaluation on test set
+test_loss, test_acc, test_preds, test_labels = evaluate(model, test_loader)
+print(f"\n🎯 Final Test Accuracy: {test_acc:.2f}%")
+
+
+# Generate classification report
+print("\n📊 Classification Report:")
+print(classification_report(test_labels, test_preds, target_names=class_names))
+
+
+# Function to predict on random images
+def predict_random_images(model, dataset, num_images=2):
+    """Predict on random images from the dataset"""
+    model.eval()
+
+
+    # Select random indices
+    random_indices = random.sample(range(len(dataset)), num_images)
+
+
+    fig, axes = plt.subplots(1, num_images, figsize=(20, 4))
+    if num_images == 1:
+        axes = [axes]
+
+
+    predictions = []
+
+
+    with torch.no_grad():
+        for i, idx in enumerate(random_indices):
+            # Get image and true label
+            image_tensor, true_label, image_path = dataset[idx]
+            image_tensor = image_tensor.unsqueeze(0).to(device)
+
+
+            # Make prediction
+            if scaler:
+                with autocast():
+                    output = model(image_tensor)
+            else:
+                output = model(image_tensor)
+
+
+            probs = torch.softmax(output, dim=1)
+            predicted_class = torch.argmax(probs, dim=1).item()
+            confidence = probs[0][predicted_class].item()
+
+
+            # Store prediction info
+            predictions.append({
+                'image_path': image_path,
+                'true_label': class_names[true_label],
+                'predicted_label': class_names[predicted_class],
+                'confidence': confidence,
+                'correct': true_label == predicted_class
+            })
+
+
+            # Load original image for display
+            original_image = Image.open(image_path).convert("RGB")
+
+
+            # Display image
+            axes[i].imshow(original_image)
+            axes[i].axis('off')
+
+
+            # Create title with prediction info
+            status = "✅" if true_label == predicted_class else "❌"
+            title = f"{status} True: {class_names[true_label]}\nPred: {class_names[predicted_class]}\nConf: {confidence*100:.1f}%"
+            axes[i].set_title(title, fontsize=10, pad=10)
+
+
+    plt.tight_layout()
+    plt.suptitle("Random Image Predictions", fontsize=16, y=1.02)
+    plt.show()
+
+
+    # Print detailed results
+    print(f"\n🎯 Random Image Prediction Results:")
+    print("=" * 80)
+    correct_predictions = 0
+
+
+    for i, pred in enumerate(predictions):
+        status = "✅ CORRECT" if pred['correct'] else "❌ INCORRECT"
+        print(f"\nImage {i+1}: {status}")
+        print(f"📁 Path: {pred['image_path']}")
+        print(f"🎯 True Label: {pred['true_label']}")
+        print(f"🔮 Predicted: {pred['predicted_label']}")
+        print(f"📊 Confidence: {pred['confidence']*100:.2f}%")
+
+
+        if pred['correct']:
+            correct_predictions += 1
+
+
+    accuracy_on_random = (correct_predictions / num_images) * 100
+    print(f"\n📈 Accuracy on random sample: {correct_predictions}/{num_images} ({accuracy_on_random:.1f}%)")
+
+
+    return predictions
+
+
+# Test on 5 random images from test set
+print("\n🎲 Testing on 5 random images from test dataset:")
+random_predictions = predict_random_images(model, test_ds, num_images=5)
+
+
+# Plot training curves
+plt.figure(figsize=(15, 5))
+
+
+plt.subplot(1, 3, 1)
+plt.plot(train_losses, label='Train Loss', color='blue')
+plt.plot(val_losses, label='Val Loss', color='red')
+plt.title('Training and Validation Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.legend()
+plt.grid(True)
+
+
+plt.subplot(1, 3, 2)
+plt.plot(train_accs, label='Train Accuracy', color='blue')
+plt.plot(val_accs, label='Val Accuracy', color='red')
+plt.title('Training and Validation Accuracy')
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy (%)')
+plt.legend()
+plt.grid(True)
+
+
+plt.subplot(1, 3, 3)
+# Confusion matrix
+cm = confusion_matrix(test_labels, test_preds)
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+            xticklabels=class_names, yticklabels=class_names)
+plt.title('Confusion Matrix')
+plt.xlabel('Predicted')
+plt.ylabel('Actual')
+
+
+plt.tight_layout()
+plt.show()
+
+
+print(f"\n🎉 Training completed! Best validation accuracy: {best_val_acc:.2f}%")
+print(f"🎯 Final test accuracy: {test_acc:.2f}%")
+
